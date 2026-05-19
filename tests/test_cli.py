@@ -69,3 +69,39 @@ class TestCLI:
         assert result.exit_code == 0
         assert '--existing_metadata' in result.output
         assert '--existing_membership' in result.output
+
+    def test_convert_mzml_dat_help(self):
+        """Test ID-free mzML conversion command help."""
+        runner = CliRunner()
+        result = runner.invoke(cli, ['convert-mzml-dat', '--help'])
+        assert result.exit_code == 0
+        assert 'mzml' in result.output.lower()
+        assert '--workers' in result.output
+
+    def test_filter_noid_clusters_help(self):
+        """Test ID-free cluster quality command help."""
+        runner = CliRunner()
+        result = runner.invoke(cli, ['filter-noid-clusters', '--help'])
+        assert result.exit_code == 0
+        assert 'quality' in result.output.lower()
+
+    def test_build_noid_cluster_db_help(self):
+        """Test ID-free DB builder command help."""
+        runner = CliRunner()
+        result = runner.invoke(cli, ['build-noid-cluster-db', '--help'])
+        assert result.exit_code == 0
+        assert 'no-id' in result.output.lower()
+
+    def test_msp_noid_help(self):
+        """Test ID-free MSP command help."""
+        runner = CliRunner()
+        result = runner.invoke(cli, ['msp-noid', '--help'])
+        assert result.exit_code == 0
+        assert 'msp' in result.output.lower()
+
+    def test_legacy_noid_maracluster_command_is_not_public(self):
+        """Standalone no-ID MaRaCluster execution is no longer a public entry."""
+        runner = CliRunner()
+        result = runner.invoke(cli, ['--help'])
+        assert result.exit_code == 0
+        assert 'run-noid-maracluster' not in result.output

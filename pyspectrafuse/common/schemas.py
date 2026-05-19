@@ -46,3 +46,47 @@ PSM_MEMBERSHIP_SCHEMA = pa.schema([
     ('species', pa.string()),
     ('instrument', pa.string()),
 ])
+
+NOID_SPECTRUM_SCHEMA = pa.schema([
+    ('scannr', pa.int32()),
+    ('usi', pa.string()),
+    ('project_accession', pa.string()),
+    ('reference_file_name', pa.string()),
+    ('scan', pa.int32()),
+    ('charge', pa.int8()),
+    ('precursor_mz', pa.float64()),
+    ('retention_time', pa.float64()),
+    ('mz_array', pa.list_(pa.float32())),
+    ('intensity_array', pa.list_(pa.float32())),
+    ('species', pa.string()),
+    ('instrument', pa.string()),
+])
+
+NOID_CLUSTER_META_SCHEMA = pa.schema([
+    ('cluster_id', pa.string()),
+    ('species', pa.string()),
+    ('instrument', pa.string()),
+    ('charge', pa.int8()),
+    ('consensus_mz_array', pa.list_(pa.float32())),
+    ('consensus_intensity_array', pa.list_(pa.float32())),
+    ('consensus_method', pa.string()),
+    ('precursor_mz', pa.float64()),
+    ('member_count', pa.int32()),
+    ('project_count', pa.int16()),
+    ('cluster_quality_ratio', pa.float64()),
+    ('mean_similarity', pa.float64()),
+    ('is_reused_cluster', pa.bool_()),
+    ('source_datasets', pa.list_(pa.string())),
+])
+
+SPECTRUM_MEMBERSHIP_SCHEMA = pa.schema([
+    ('cluster_id', pa.string()),
+    ('usi', pa.string()),
+    ('project_accession', pa.string()),
+    ('reference_file_name', pa.string()),
+    ('scan', pa.int32()),
+    ('charge', pa.int8()),
+    ('precursor_mz', pa.float64()),
+    ('species', pa.string()),
+    ('instrument', pa.string()),
+])

@@ -94,13 +94,17 @@ def parse_all_scan_titles(scan_titles_files: List[str]) -> pd.DataFrame:
                     run_file = m.group(1)
                     orig_scan = int(m.group(2))
                     pep_charge = m.group(3)
-                    last_slash = pep_charge.rfind('/')
-                    if last_slash > 0:
-                        peptidoform = pep_charge[:last_slash]
-                        parsed_charge = int(pep_charge[last_slash + 1:])
+                    if pep_charge.startswith("charge") and pep_charge[6:].isdigit():
+                        peptidoform = None
+                        parsed_charge = int(pep_charge[6:])
                     else:
-                        peptidoform = pep_charge
-                        parsed_charge = 0
+                        last_slash = pep_charge.rfind('/')
+                        if last_slash > 0:
+                            peptidoform = pep_charge[:last_slash]
+                            parsed_charge = int(pep_charge[last_slash + 1:])
+                        else:
+                            peptidoform = pep_charge
+                            parsed_charge = 0
                     cols['run_file_name'].append(run_file)
                     cols['orig_scan'].append(orig_scan)
                     cols['peptidoform'].append(peptidoform)

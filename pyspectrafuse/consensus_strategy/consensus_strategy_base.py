@@ -2,8 +2,8 @@ import logging
 from typing import Tuple
 import numpy as np
 import pandas as pd
-import spectrum_utils.spectrum as sus
 from pyspectrafuse.common.constant import ClusterConstants
+import spectrum_utils.spectrum as sus
 
 logger = logging.getLogger(__name__)
 

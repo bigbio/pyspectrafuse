@@ -195,7 +195,9 @@ def _convert_batch(batch: pa.RecordBatch, col_names: set) -> pa.RecordBatch:
     columns["run_file_name"] = table.column("reference_file_name").cast(pa.string())
     columns["calculated_mz"] = table.column("cal_mass_to_charge").cast(pa.float32()) if "cal_mass_to_charge" in col_names else pa.nulls(n, type=pa.float32())
 
-    columns["scan"] = _wrap_scan_as_list(table.column("scan"))
+    columns["scan"] = _wrap_scan_as_list(table.column("scan").cast(pa.int32()) if pa.types.is_string(table.column("scan").type) else table.column("scan"))
+
+    # columns["scan"] = _wrap_scan_as_list(table.column("scan"))
     columns["rt"] = table.column("retention_time").cast(pa.float32()) if "retention_time" in col_names else pa.nulls(n, type=pa.float32())
     columns["additional_scores"] = _build_additional_scores(table.column("global_qvalue")) if "global_qvalue" in col_names else pa.nulls(n, type=QPX_PSM_SCHEMA.field("additional_scores").type)
     columns["modifications"] = _convert_modifications(table.column("modifications")) if "modifications" in col_names else pa.nulls(n, type=QPX_PSM_SCHEMA.field("modifications").type)
