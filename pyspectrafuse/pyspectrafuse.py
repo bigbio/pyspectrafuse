@@ -10,6 +10,7 @@ from pyspectrafuse.commands.mzml_noid import (
     filter_noid_clusters_cmd,
     msp_noid_cmd,
 )
+from pyspectrafuse.commands.reduce_psm import reduce_psm_cmd, verify_reduced_psm_cmd
 from pyspectrafuse import __version__
 
 CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"])
@@ -36,6 +37,8 @@ cli.add_command(convert_mzml_dat_cmd)
 cli.add_command(filter_noid_clusters_cmd)
 cli.add_command(build_noid_cluster_db_cmd)
 cli.add_command(msp_noid_cmd)
+cli.add_command(reduce_psm_cmd)
+cli.add_command(verify_reduced_psm_cmd)
 
 
 def main():

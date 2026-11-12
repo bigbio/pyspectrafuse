@@ -21,7 +21,10 @@ CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"])
               help='Filter to specific charge state (default: all charges)')
 @click.option('--file_idx', type=int, default=0,
               help='Starting file index for multi-file batches (default: 0)')
-def parquet2dat(parquet_dir: str, output_dir: str, charge: int, file_idx: int):
+@click.option('--combine', is_flag=True, default=False,
+              help='Write all .psm.parquet files of the directory (e.g. project parts) into one '
+                   '.dat set named after the directory, with scannr unique across parts')
+def parquet2dat(parquet_dir: str, output_dir: str, charge: int, file_idx: int, combine: bool):
     """Convert PSM parquet files to MaRaCluster .dat binary format.
 
     Bypasses MGF text entirely. Output is ~15x smaller than MGF.
@@ -42,6 +45,14 @@ def parquet2dat(parquet_dir: str, output_dir: str, charge: int, file_idx: int):
 
     total_written = 0
     total_skipped = 0
+
+    if combine:
+        written, skipped, dat_path = parquet_to_dat(
+            parquet_files, output_dir, file_idx=file_idx, charge_filter=charge,
+            name=Path(parquet_dir).resolve().name)
+        click.echo(f"  {len(parquet_files)} files: {written} spectra written, {skipped} skipped → {dat_path}")
+        parquet_files = []
+        total_written, total_skipped = written, skipped
 
     for i, pf in enumerate(parquet_files):
         written, skipped, dat_path = parquet_to_dat(

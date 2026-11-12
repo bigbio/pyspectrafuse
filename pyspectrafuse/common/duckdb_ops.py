@@ -7,6 +7,7 @@ DuckDB connection (batch operations, not long-lived).
 Used by: build_cluster_db.py, incremental.py, merge_results.py, resolve_clusters_dat.py
 """
 import logging
+import os
 from pathlib import Path
 from typing import List, Optional, Union
 
@@ -17,9 +18,16 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
-def _create_connection(memory_limit: str = '4GB', threads: int = 4,
-                       temp_directory: str = None) -> duckdb.DuckDBPyConnection:
-    """Create an in-memory DuckDB connection with sensible defaults."""
+def _create_connection(memory_limit: Optional[str] = None, threads: Optional[int] = None,
+                       temp_directory: Optional[str] = None) -> duckdb.DuckDBPyConnection:
+    """Create an in-memory DuckDB connection.
+
+    Defaults come from SPECTRAFUSE_DUCKDB_MEMORY / _THREADS / _TEMP_DIR (set by the
+    Nextflow task from its own memory and cpus), else 4GB and 4 threads.
+    """
+    memory_limit = memory_limit or os.environ.get('SPECTRAFUSE_DUCKDB_MEMORY', '4GB')
+    threads = threads or int(os.environ.get('SPECTRAFUSE_DUCKDB_THREADS', '4'))
+    temp_directory = temp_directory or os.environ.get('SPECTRAFUSE_DUCKDB_TEMP_DIR')
     conn = duckdb.connect(':memory:')
     conn.execute(f"SET memory_limit='{memory_limit}'")
     conn.execute(f"SET threads={threads}")
@@ -497,11 +505,12 @@ def merge_mz_window_clusters(
                              names=['mgf_path', 'scannr', 'cluster_id'],
                              skip_blank_lines=False)
             df = df.dropna()
+            df['scannr'] = df['scannr'].astype('int64')
             df['window_idx'] = i
             df['window_min_mz'] = min_mz
             df['window_max_mz'] = max_mz
             # Prefix cluster IDs with window index to avoid collisions
-            df['cluster_id'] = f'w{i}_' + df['cluster_id'].astype(str)
+            df['cluster_id'] = f'w{i}_' + df['cluster_id'].astype('int64').astype(str)
             all_parts.append(df)
 
         if not all_parts:

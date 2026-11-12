@@ -124,38 +124,70 @@ def _pack_scaninfo(file_idx: int, scannr: int,
 
 
 def parquet_to_dat(
-    parquet_path: str,
+    parquet_path,
     output_dir: str,
     file_idx: int = 0,
     charge_filter: Optional[int] = None,
     batch_size: int = 50_000,
+    name: Optional[str] = None,
 ) -> Tuple[int, int, str]:
-    """Convert a QPX .psm.parquet file to MaRaCluster .dat binary format.
+    """Convert one QPX .psm.parquet file (or a list of them) to MaRaCluster .dat binary format.
 
     Writes three files:
       - {name}.dat          — array of 100-byte Spectrum structs
       - {name}.scan_info.dat — array of 16-byte ScanInfo structs
       - {name}.scan_titles.txt — TSV of (fileIdx, scannr, title)
 
+    A list of parquet files (e.g. the parts of one project) is written into one
+    set of files with scannr continuing across parts, so scannr stays unique
+    within the partition.
+
     Args:
-        parquet_path: Path to .psm.parquet file
+        parquet_path: Path to a .psm.parquet file, or a list of paths
         output_dir: Directory to write .dat files
         file_idx: 0-based file index for this file in the batch
         charge_filter: If set, only include spectra with this charge
         batch_size: Arrow batch size for streaming reads
+        name: Output stem (default: the parquet file stem)
 
     Returns:
         Tuple of (spectra_written, spectra_skipped, dat_path)
     """
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    name = Path(parquet_path).stem
+    paths = [parquet_path] if isinstance(parquet_path, (str, Path)) else list(parquet_path)
+    if not paths:
+        raise ValueError("no parquet files given")
+    name = name or Path(paths[0]).stem
     if charge_filter is not None:
         name = f"{name}_charge{charge_filter}"
     dat_path = str(Path(output_dir) / f"{name}.dat")
     scaninfo_path = str(Path(output_dir) / f"{name}.scan_info.dat")
     titles_path = str(Path(output_dir) / f"{name}.scan_titles.txt")
 
+    written = 0
+    skipped = 0
+
+    with open(dat_path, 'wb') as f_dat, \
+         open(scaninfo_path, 'wb') as f_scaninfo, \
+         open(titles_path, 'w') as f_titles:
+        for one_path in paths:
+            w, sk = _write_parquet_spectra(one_path, f_dat, f_scaninfo, f_titles, file_idx,
+                                           charge_filter, batch_size, written)
+            written += w
+            skipped += sk
+
+    dat_size = Path(dat_path).stat().st_size
+    logger.info(f"Wrote {written} spectra to {dat_path} "
+                f"({dat_size / 1e6:.1f} MB, {skipped} skipped)")
+
+    return written, skipped, dat_path
+
+
+def _write_parquet_spectra(parquet_path, f_dat, f_scaninfo, f_titles, file_idx: int,
+                           charge_filter: Optional[int], batch_size: int,
+                           scannr_start: int) -> Tuple[int, int]:
+    """Append the spectra of one parquet file to open .dat/.scan_info/.titles handles."""
     pf = pq.ParquetFile(parquet_path)
     columns = ['mz_array', 'intensity_array', 'charge',
                'observed_mz', 'calculated_mz', 'rt', 'scan',
@@ -168,104 +200,96 @@ def parquet_to_dat(
     written = 0
     skipped = 0
 
-    with open(dat_path, 'wb') as f_dat, \
-         open(scaninfo_path, 'wb') as f_scaninfo, \
-         open(titles_path, 'w') as f_titles:
+    for batch in pf.iter_batches(batch_size=batch_size, columns=read_cols):
+        df = batch.to_pandas()
 
-        for batch in pf.iter_batches(batch_size=batch_size, columns=read_cols):
-            df = batch.to_pandas()
-
-            if charge_filter is not None and 'charge' in df.columns:
-                df = df[df['charge'] == charge_filter]
-                if df.empty:
-                    continue
-
-            # Vectorized column access
-            mz_arrays = df['mz_array'].values if 'mz_array' in df.columns else None
-            int_arrays = df['intensity_array'].values if 'intensity_array' in df.columns else None
-            if mz_arrays is None or int_arrays is None:
-                skipped += len(df)
+        if charge_filter is not None and 'charge' in df.columns:
+            df = df[df['charge'] == charge_filter]
+            if df.empty:
                 continue
 
-            charges = df['charge'].values if 'charge' in df.columns else np.zeros(len(df), dtype=np.int32)
-            obs_mz = df['observed_mz'].values if 'observed_mz' in df.columns else None
-            calc_mz = df['calculated_mz'].values if 'calculated_mz' in df.columns else None
-            runs = df['run_file_name'].values if 'run_file_name' in df.columns else [''] * len(df)
-            peps = df['peptidoform'].values if 'peptidoform' in df.columns else [''] * len(df)
-            scans = df['scan'].values if 'scan' in df.columns else [0] * len(df)
+        # Vectorized column access
+        mz_arrays = df['mz_array'].values if 'mz_array' in df.columns else None
+        int_arrays = df['intensity_array'].values if 'intensity_array' in df.columns else None
+        if mz_arrays is None or int_arrays is None:
+            skipped += len(df)
+            continue
 
-            # Pre-allocate buffers for batch writing
-            dat_buf = bytearray()
-            scaninfo_buf = bytearray()
-            title_lines = []
+        charges = df['charge'].values if 'charge' in df.columns else np.zeros(len(df), dtype=np.int32)
+        obs_mz = df['observed_mz'].values if 'observed_mz' in df.columns else None
+        calc_mz = df['calculated_mz'].values if 'calculated_mz' in df.columns else None
+        runs = df['run_file_name'].values if 'run_file_name' in df.columns else [''] * len(df)
+        peps = df['peptidoform'].values if 'peptidoform' in df.columns else [''] * len(df)
+        scans = df['scan'].values if 'scan' in df.columns else [0] * len(df)
 
-            for i in range(len(df)):
-                mz_arr = mz_arrays[i]
-                int_arr = int_arrays[i]
-                if mz_arr is None or int_arr is None:
-                    skipped += 1
-                    continue
+        # Pre-allocate buffers for batch writing
+        dat_buf = bytearray()
+        scaninfo_buf = bytearray()
+        title_lines = []
 
-                mz_arr = np.asarray(mz_arr, dtype=np.float64)
-                int_arr = np.asarray(int_arr, dtype=np.float64)
+        for i in range(len(df)):
+            mz_arr = mz_arrays[i]
+            int_arr = int_arrays[i]
+            if mz_arr is None or int_arr is None:
+                skipped += 1
+                continue
 
-                if len(mz_arr) == 0 or len(int_arr) == 0:
-                    skipped += 1
-                    continue
+            mz_arr = np.asarray(mz_arr, dtype=np.float64)
+            int_arr = np.asarray(int_arr, dtype=np.float64)
 
-                charge = int(charges[i])
-                if charge <= 0:
-                    skipped += 1
-                    continue
+            if len(mz_arr) == 0 or len(int_arr) == 0:
+                skipped += 1
+                continue
 
-                # Precursor m/z: prefer observed_mz, fall back to calculated_mz
-                prec_mz = obs_mz[i] if obs_mz is not None else None
-                if prec_mz is None or np.isnan(prec_mz):
-                    prec_mz = calc_mz[i] if calc_mz is not None else 0.0
-                prec_mz = float(prec_mz)
+            charge = int(charges[i])
+            if charge <= 0:
+                skipped += 1
+                continue
 
-                # Neutral mass for peak filtering
-                prec_mass = prec_mz * charge - PROTON_MASS * (charge - 1)
+            # Precursor m/z: prefer observed_mz, fall back to calculated_mz
+            prec_mz = obs_mz[i] if obs_mz is not None else None
+            if prec_mz is None or np.isnan(prec_mz):
+                prec_mz = calc_mz[i] if calc_mz is not None else 0.0
+            prec_mz = float(prec_mz)
 
-                # Bin the spectrum
-                peak_bins = _bin_spectrum(mz_arr, int_arr, prec_mass)
-                if len(peak_bins) < MIN_SCORING_PEAKS:
-                    skipped += 1
-                    continue
+            # Neutral mass for peak filtering
+            prec_mass = prec_mz * charge - PROTON_MASS * (charge - 1)
 
-                scannr = written
+            # Bin the spectrum
+            peak_bins = _bin_spectrum(mz_arr, int_arr, prec_mass)
+            if len(peak_bins) < MIN_SCORING_PEAKS:
+                skipped += 1
+                continue
 
-                # Buffer writes instead of per-row I/O
-                dat_buf.extend(_pack_spectrum(
-                    file_idx, scannr, charge, prec_mz, 0.0, peak_bins))
-                scaninfo_buf.extend(_pack_scaninfo(
-                    file_idx, scannr, prec_mz, prec_mz))
+            scannr = scannr_start + written
 
-                orig_scan = scans[i]
-                if orig_scan is not None:
-                    if isinstance(orig_scan, (list, np.ndarray)):
-                        orig_scan = int(orig_scan[0]) if len(orig_scan) > 0 else 0
-                    else:
-                        orig_scan = int(orig_scan)
+            # Buffer writes instead of per-row I/O
+            dat_buf.extend(_pack_spectrum(
+                file_idx, scannr, charge, prec_mz, 0.0, peak_bins))
+            scaninfo_buf.extend(_pack_scaninfo(
+                file_idx, scannr, prec_mz, prec_mz))
+
+            orig_scan = scans[i]
+            if orig_scan is not None:
+                if isinstance(orig_scan, (list, np.ndarray)):
+                    orig_scan = int(orig_scan[0]) if len(orig_scan) > 0 else 0
                 else:
-                    orig_scan = 0
-                run = runs[i] if runs[i] is not None else ''
-                pep = peps[i] if peps[i] is not None else ''
-                title_lines.append(f"{file_idx}\t{scannr}\tid=mzspec::{run}:scan:{orig_scan}:{pep}/{charge}\n")
+                    orig_scan = int(orig_scan)
+            else:
+                orig_scan = 0
+            run = runs[i] if runs[i] is not None else ''
+            pep = peps[i] if peps[i] is not None else ''
+            title_lines.append(f"{file_idx}\t{scannr}\tid=mzspec::{run}:scan:{orig_scan}:{pep}/{charge}\n")
 
-                written += 1
+            written += 1
 
-            # Flush batch buffers
-            if dat_buf:
-                f_dat.write(dat_buf)
-                f_scaninfo.write(scaninfo_buf)
-                f_titles.writelines(title_lines)
+        # Flush batch buffers
+        if dat_buf:
+            f_dat.write(dat_buf)
+            f_scaninfo.write(scaninfo_buf)
+            f_titles.writelines(title_lines)
 
-    dat_size = Path(dat_path).stat().st_size
-    logger.info(f"Wrote {written} spectra to {dat_path} "
-                f"({dat_size / 1e6:.1f} MB, {skipped} skipped)")
-
-    return written, skipped, dat_path
+    return written, skipped
 
 
 def convert_dataset_to_dat(
@@ -324,6 +348,44 @@ def write_dat_file_list(dat_paths: List[str], output_path: str) -> str:
     return output_path
 
 
+def mz_windows(prec_mzs: np.ndarray, window_size: float = 300.0, window_overlap: float = 1.0,
+               min_mz: float = 200.0, max_mz: float = 2000.0,
+               max_spectra: Optional[int] = None) -> List[Tuple[float, float]]:
+    """Precursor m/z windows: fixed-width, then any window holding more than ``max_spectra`` spectra is cut
+    into equal-count sub-windows. Adjacent windows overlap by ``window_overlap`` Da so every pair of spectra
+    within MaRaCluster's precursor tolerance shares at least one window."""
+    if window_overlap >= window_size:
+        raise ValueError(
+            f"window_overlap ({window_overlap}) must be less than "
+            f"window_size ({window_size}) to avoid infinite loop")
+    fixed = []
+    start = min_mz
+    while start < max_mz:
+        end = min(start + window_size, max_mz)
+        fixed.append((start, end))
+        if end >= max_mz:
+            break
+        start = end - window_overlap
+    if not max_spectra:
+        return fixed
+    srt = np.sort(prec_mzs)
+    out = []
+    for wmin, wmax in fixed:
+        lo, hi = np.searchsorted(srt, wmin), np.searchsorted(srt, wmax)
+        n = hi - lo
+        k = int(np.ceil(n / max_spectra)) if n > max_spectra else 1
+        cuts = [wmin]
+        for j in range(1, k):
+            pos = lo + (j * n) // k
+            cut = float(srt[pos - 1] + srt[pos]) / 2
+            if cut - window_overlap > cuts[-1]:
+                cuts.append(cut)
+        cuts.append(wmax)
+        for j in range(len(cuts) - 1):
+            out.append((cuts[j] if j == 0 else cuts[j] - window_overlap, cuts[j + 1]))
+    return out
+
+
 def split_dat_by_mz_window(
     dat_path: str,
     scaninfo_path: str,
@@ -333,13 +395,15 @@ def split_dat_by_mz_window(
     window_overlap: float = 1.0,
     min_mz: float = 200.0,
     max_mz: float = 2000.0,
+    max_spectra_per_window: Optional[int] = None,
 ) -> List[Dict]:
     """Split a .dat file into precursor m/z windows for parallel MaRaCluster.
 
     MaRaCluster uses 20 ppm precursor tolerance internally — spectra far apart
     in m/z can NEVER cluster together. This function formalizes that by splitting
     spectra into overlapping m/z windows, enabling Nextflow to run MaRaCluster
-    on each window in parallel.
+    on each window in parallel. With ``max_spectra_per_window`` dense windows are
+    cut further into equal-count sub-windows, which bounds MaRaCluster's memory.
 
     Args:
         dat_path: Path to the .dat file (100 bytes/spectrum).
@@ -350,6 +414,7 @@ def split_dat_by_mz_window(
         window_overlap: Overlap between adjacent windows in Da (default 1.0).
         min_mz: Minimum precursor m/z (default 200).
         max_mz: Maximum precursor m/z (default 2000).
+        max_spectra_per_window: Cut windows holding more spectra than this (default: no cut).
 
     Returns:
         List of dicts, each with keys:
@@ -363,85 +428,38 @@ def split_dat_by_mz_window(
     """
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    # Read all spectra: extract precursor m/z from each 100-byte struct
-    dat_size = Path(dat_path).stat().st_size
-    n_spectra = dat_size // SPECTRUM_STRUCT.size
+    dat = np.fromfile(dat_path, dtype=np.uint8)
+    n_spectra = len(dat) // SPECTRUM_STRUCT.size
     if n_spectra == 0:
         return []
-
-    # Read all precursor m/z values from .dat (offset 12 in the struct: 3×uint32, then float32)
-    prec_mzs = np.zeros(n_spectra, dtype=np.float32)
-    with open(dat_path, 'rb') as f:
-        for i in range(n_spectra):
-            data = f.read(SPECTRUM_STRUCT.size)
-            unpacked = SPECTRUM_STRUCT.unpack(data)
-            prec_mzs[i] = unpacked[3]  # precMz is 4th field
-
-    # Read scan_titles lines
+    dat = dat[:n_spectra * SPECTRUM_STRUCT.size].reshape(n_spectra, SPECTRUM_STRUCT.size)
+    # precMz is the float32 after three uint32 (fileIdx, scannr, charge)
+    prec_mzs = np.ascontiguousarray(dat[:, 12:16]).view('<f4').ravel()
+    scaninfo = np.fromfile(scaninfo_path, dtype=np.uint8)
+    n_si = len(scaninfo) // SCANINFO_STRUCT.size
+    scaninfo = scaninfo[:n_si * SCANINFO_STRUCT.size].reshape(n_si, SCANINFO_STRUCT.size)
     with open(titles_path) as f:
         title_lines = f.readlines()
 
-    # Read scaninfo records
-    scaninfo_size = Path(scaninfo_path).stat().st_size
-    with open(scaninfo_path, 'rb') as f:
-        scaninfo_data = f.read()
-
-    # Compute window boundaries
-    if window_overlap >= window_size:
-        raise ValueError(
-            f"window_overlap ({window_overlap}) must be less than "
-            f"window_size ({window_size}) to avoid infinite loop")
-    windows = []
-    window_start = min_mz
-    idx = 0
-    while window_start < max_mz:
-        window_end = min(window_start + window_size, max_mz)
-        windows.append((idx, window_start, window_end))
-        if window_end >= max_mz:
-            break
-        window_start = window_end - window_overlap
-        idx += 1
-
-    # Read all .dat records at once
-    with open(dat_path, 'rb') as f:
-        dat_data = f.read()
-
+    windows = mz_windows(prec_mzs, window_size, window_overlap, min_mz, max_mz, max_spectra_per_window)
     stem = Path(dat_path).stem
     results = []
-
-    for widx, wmin, wmax in windows:
-        # Find spectra in this window
-        mask = (prec_mzs >= wmin) & (prec_mzs < wmax)
-        indices = np.where(mask)[0]
-
+    idx = -1
+    for wmin, wmax in windows:
+        idx += 1
+        indices = np.nonzero((prec_mzs >= wmin) & (prec_mzs < wmax))[0]
         if len(indices) == 0:
             continue
-
-        # Write window-specific files
-        w_dat_path = str(Path(output_dir) / f"{stem}_w{widx}.dat")
-        w_scaninfo_path = str(Path(output_dir) / f"{stem}_w{widx}.scan_info.dat")
-        w_titles_path = str(Path(output_dir) / f"{stem}_w{widx}.scan_titles.txt")
-
-        with open(w_dat_path, 'wb') as f_dat, \
-             open(w_scaninfo_path, 'wb') as f_si, \
-             open(w_titles_path, 'w') as f_titles:
-
-            for orig_idx in indices:
-                # Copy original spectrum struct unchanged (preserve original scannr)
-                offset = orig_idx * SPECTRUM_STRUCT.size
-                f_dat.write(dat_data[offset:offset + SPECTRUM_STRUCT.size])
-
-                # Copy scaninfo unchanged
-                si_offset = orig_idx * SCANINFO_STRUCT.size
-                if si_offset + SCANINFO_STRUCT.size <= len(scaninfo_data):
-                    f_si.write(scaninfo_data[si_offset:si_offset + SCANINFO_STRUCT.size])
-
-                # Copy scan title unchanged
-                if orig_idx < len(title_lines):
-                    f_titles.write(title_lines[orig_idx])
-
+        w_dat_path = str(Path(output_dir) / f"{stem}_w{idx}.dat")
+        w_scaninfo_path = str(Path(output_dir) / f"{stem}_w{idx}.scan_info.dat")
+        w_titles_path = str(Path(output_dir) / f"{stem}_w{idx}.scan_titles.txt")
+        # original structs, scaninfo and titles copied unchanged (original scannr kept)
+        dat[indices].tofile(w_dat_path)
+        scaninfo[indices[indices < n_si]].tofile(w_scaninfo_path)
+        with open(w_titles_path, 'w') as f_titles:
+            f_titles.writelines(title_lines[i] for i in indices if i < len(title_lines))
         results.append({
-            'window_idx': widx,
+            'window_idx': idx,
             'mz_min': wmin,
             'mz_max': wmax,
             'dat_path': w_dat_path,
@@ -449,8 +467,7 @@ def split_dat_by_mz_window(
             'titles_path': w_titles_path,
             'n_spectra': len(indices),
         })
-
-        logger.info(f"Window {widx} [{wmin:.0f}-{wmax:.0f} Da]: "
+        logger.info(f"Window {idx} [{wmin:.1f}-{wmax:.1f} Da]: "
                      f"{len(indices)} spectra → {w_dat_path}")
 
     logger.info(f"Split {n_spectra} spectra into {len(results)} m/z windows")
