@@ -222,13 +222,13 @@ def test_reduce_with_thinning(tmp_path):
     out = str(tmp_path / "out.psm.parquet")
     st = reduce_psms(_files(psm_dir), [tsv], [titles], out, max_rows_per_pfz=5, max_psms_per_pfz_clustered=12)
     assert st["psms_thinned"] == int((~keep).sum()) == 39 and st["pfz_thinned"] == 2
-    assert st["psms_unclustered"] == 2 and st["psms_thinned_dropped"] == 0
+    assert st["psms_unclustered"] == 2 and "psms_thinned_dropped" not in st
     t = pq.read_table(out)
     pfs = t["peptidoform"].to_pylist()
     assert pfs.count("MANYPEPK") == 5
     sc = {p: {x["score_name"]: x["score_value"] for x in s} for p, s in zip(pfs, t["additional_scores"].to_pylist())}
-    assert sc["MANYPEPK"]["pfz_psms"] == 50 and sc["MANYPEPK"]["pfz_runs"] == 7
-    assert sc["PEPTIDEK"]["pfz_psms"] == 13
+    assert sc["MANYPEPK"]["pfz_psms"] == 12 and sc["PEPTIDEK"]["pfz_psms"] == 12
+    assert st["psms_in_pfz_totals"] + st["psms_thinned"] + st["psms_contradicted_removed"] == st["psms_in"]
     kept = set(np.load(out + ".keep.npy").tolist())
     assert kept <= set(np.nonzero(keep)[0].tolist())
     assert json.loads(pq.ParquetFile(out).schema_arrow.metadata[b"clustering_params"])["max_psms_per_pfz_clustered"] == 12
@@ -316,4 +316,4 @@ def test_reduce_duplicates_with_thinning(tmp_path):
     assert st["psms_in"] == len(rows) + len(many)
     sc = {p: {x["score_name"]: x["score_value"] for x in s}
           for p, s in zip(pq.read_table(out)["peptidoform"].to_pylist(), pq.read_table(out)["additional_scores"].to_pylist())}
-    assert sc["MANYPEPK"]["pfz_psms"] == 50
+    assert sc["MANYPEPK"]["pfz_psms"] == 12
