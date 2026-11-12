@@ -56,8 +56,10 @@ def find_target_ext_files(directory: str, extensions: str) -> List[str]:
             continue
         if any(str(file).endswith(s) for s in exclude_suffixes):
             continue
+        if extensions == '.parquet' and not file.name.endswith('.psm.parquet'):
+            continue
         res.append(str(file))
-    return res
+    return sorted(res)
 
 
 def create_consensus_strategy(method_type: str, sim: str = 'dot',

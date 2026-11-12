@@ -5,7 +5,7 @@ FROM python:3.10-slim
 LABEL base_image="python:3.10-slim"
 LABEL version="1"
 LABEL software="pyspectrafuse"
-LABEL software.version="0.0.4"
+LABEL software.version="0.0.6"
 LABEL about.summary="pyspectrafuse - CLI for spectral clustering and consensus library generation"
 LABEL about.home="https://github.com/bigbio/pyspectrafuse"
 LABEL about.documentation="https://github.com/bigbio/pyspectrafuse"

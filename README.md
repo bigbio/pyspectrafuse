@@ -161,6 +161,25 @@ pyspectrafuse convert-to-qpx \
     --output data.psm.parquet
 ```
 
+#### Reduce a project to one ID-based psm file
+
+After a project's PSMs are clustered (convert-dat → MaRaCluster → merged TSV per charge), write one reduced
+qpx psm file with the same schema:
+
+```bash
+pyspectrafuse reduce-psm \
+    --psm-dir project/ \
+    --clusters charge2/clusters_p30.tsv --clusters charge3/clusters_p30.tsv \
+    --titles project_charge2.scan_titles.txt --titles project_charge3.scan_titles.txt \
+    -o project.psm.parquet --max-rows-per-pfz 30
+```
+
+Rules: identifications contradicted by a >= 0.8 cluster majority are removed; with `--weak-filter` (replicate-run projects only), PSMs whose
+peptidoform is seen in <= 2 runs and whose longest b/y ion series is < 4 are removed (needs `ion_type_array`); the best-PEP PSM per (cluster, peptidoform, charge) is kept; at most `--max-rows-per-pfz` rows
+per peptidoform+charge, spread over RT. Kept rows are unchanged; cluster scores are added to
+`additional_scores`, `cluster_id` to `cv_params`, `qvalue` = running mean PEP, and the rule and parameters to
+the parquet footer. The output is verified row by row (`verify-reduced-psm` repeats the check).
+
 ### Python API
 
 ```python

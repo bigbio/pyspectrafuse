@@ -34,6 +34,8 @@ class ParquetPathHandler:
         # 自动忽略后续的连字符、UUID、扩展名等所有内容
         match = re.search(r'^([A-Za-z]+\d+)', last_path_part)
 
+        if not match and last_path_part.split('.')[0]:
+            return last_path_part.split('.')[0]
         if not match:
             raise ValueError(f"Could not extract project ID from path segment: {last_path_part}"
                              f" (Please ensure the path contains a project identifier starting with letters followed by digits.)")
