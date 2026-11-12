@@ -130,6 +130,7 @@ def parquet_to_dat(
     charge_filter: Optional[int] = None,
     batch_size: int = 50_000,
     name: Optional[str] = None,
+    max_psms_per_pfz: Optional[int] = None,
 ) -> Tuple[int, int, str]:
     """Convert one QPX .psm.parquet file (or a list of them) to MaRaCluster .dat binary format.
 
@@ -149,6 +150,8 @@ def parquet_to_dat(
         charge_filter: If set, only include spectra with this charge
         batch_size: Arrow batch size for streaming reads
         name: Output stem (default: the parquet file stem)
+        max_psms_per_pfz: If set, a peptidoform+charge with more PSMs than this (over all given files and
+            charges) contributes only that many, spread over runs and RT (see common.thinning)
 
     Returns:
         Tuple of (spectra_written, spectra_skipped, dat_path)
@@ -165,15 +168,16 @@ def parquet_to_dat(
     scaninfo_path = str(Path(output_dir) / f"{name}.scan_info.dat")
     titles_path = str(Path(output_dir) / f"{name}.scan_titles.txt")
 
+    masks = _thin_masks(paths, max_psms_per_pfz)
     written = 0
     skipped = 0
 
     with open(dat_path, 'wb') as f_dat, \
          open(scaninfo_path, 'wb') as f_scaninfo, \
          open(titles_path, 'w') as f_titles:
-        for one_path in paths:
+        for one_path, mask in zip(paths, masks):
             w, sk = _write_parquet_spectra(one_path, f_dat, f_scaninfo, f_titles, file_idx,
-                                           charge_filter, batch_size, written)
+                                           charge_filter, batch_size, written, mask)
             written += w
             skipped += sk
 
@@ -184,9 +188,23 @@ def parquet_to_dat(
     return written, skipped, dat_path
 
 
+def _thin_masks(paths, cap: Optional[int]):
+    if not cap:
+        return [None] * len(paths)
+    from pyspectrafuse.common.thinning import thin_mask
+    import pyarrow as pa
+    t = pa.concat_tables([pq.read_table(p, columns=['peptidoform', 'charge', 'run_file_name', 'rt'])
+                          for p in paths])
+    keep = thin_mask(t['peptidoform'].to_numpy(zero_copy_only=False), t['charge'].to_numpy(zero_copy_only=False),
+                     t['run_file_name'].to_numpy(zero_copy_only=False), t['rt'].to_numpy(zero_copy_only=False), cap)
+    logger.info(f"thinning: {int((~keep).sum())} of {len(keep)} PSMs left out (cap {cap} per peptidoform+charge)")
+    bounds = np.cumsum([0] + [pq.ParquetFile(p).metadata.num_rows for p in paths])
+    return [keep[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
+
+
 def _write_parquet_spectra(parquet_path, f_dat, f_scaninfo, f_titles, file_idx: int,
                            charge_filter: Optional[int], batch_size: int,
-                           scannr_start: int) -> Tuple[int, int]:
+                           scannr_start: int, mask: Optional[np.ndarray] = None) -> Tuple[int, int]:
     """Append the spectra of one parquet file to open .dat/.scan_info/.titles handles."""
     pf = pq.ParquetFile(parquet_path)
     columns = ['mz_array', 'intensity_array', 'charge',
@@ -200,8 +218,12 @@ def _write_parquet_spectra(parquet_path, f_dat, f_scaninfo, f_titles, file_idx: 
     written = 0
     skipped = 0
 
+    offset = 0
     for batch in pf.iter_batches(batch_size=batch_size, columns=read_cols):
         df = batch.to_pandas()
+        if mask is not None:
+            df = df[mask[offset:offset + len(df)]]
+        offset += batch.num_rows
 
         if charge_filter is not None and 'charge' in df.columns:
             df = df[df['charge'] == charge_filter]

@@ -22,6 +22,8 @@ from pyspectrafuse.reduce_psm import DEFAULTS, find_psm_files, reduce_psms, veri
 @click.option("--weak-min-series", default=DEFAULTS["weak_min_series"], show_default=True, type=int)
 @click.option("--weak-filter/--no-weak-filter", default=False, show_default=True,
               help="Remove weak-evidence PSMs; calibrated on replicate-run projects only (fractionated projects see most true peptides in <= 2 runs)")
+@click.option("--max-psms-per-pfz-clustered", default=None, type=int,
+              help="Same value as convert-dat --max-psms-per-pfz (PSMs left out of clustering by the cap)")
 @click.option("--method", default="MaRaCluster via spectrafuse", show_default=True,
               help="Clustering method text written to the footer")
 @click.option("--memory", default="8GB", show_default=True, help="DuckDB memory limit")
@@ -29,13 +31,14 @@ from pyspectrafuse.reduce_psm import DEFAULTS, find_psm_files, reduce_psms, veri
 @click.option("--verify/--no-verify", default=True, show_default=True,
               help="Re-read the output and check every kept row against its source row")
 def reduce_psm_cmd(psm_dir, clusters, titles, output, max_rows_per_pfz, majority, weak_max_runs,
-                   weak_min_series, weak_filter, method, memory, threads, verify):
+                   weak_min_series, weak_filter, max_psms_per_pfz_clustered, method, memory, threads, verify):
     """Reduce one project's PSMs to a single qpx psm file (see pyspectrafuse.reduce_psm for the rules)."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     files = find_psm_files(psm_dir)
     stats = reduce_psms(files, list(clusters), list(titles), output, max_rows_per_pfz=max_rows_per_pfz,
                         majority=majority, weak_max_runs=weak_max_runs, weak_min_series=weak_min_series,
-                        weak_filter=weak_filter, method=method, memory_limit=memory, threads=threads)
+                        weak_filter=weak_filter, max_psms_per_pfz_clustered=max_psms_per_pfz_clustered,
+                        method=method, memory_limit=memory, threads=threads)
     click.echo("BUILT " + json.dumps(stats))
     if verify:
         click.echo("VERIFIED " + json.dumps(verify_reduced(files, output)))

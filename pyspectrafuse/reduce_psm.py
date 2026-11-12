@@ -6,7 +6,9 @@ Rules, in order (all PSMs of the project are clustered first, per charge, with M
    majority that holds >= ``majority`` of the cluster's PSMs is removed.
 2. Weak evidence (opt-in, for replicate-run projects): a PSM whose peptidoform+charge is seen in <= ``weak_max_runs`` runs AND whose longest
    consecutive b or y ion series is < ``weak_min_series`` is removed (needs ``ion_type_array``).
-3. One row per (cluster, peptidoform, charge): the best-PEP PSM.
+3. One row per (cluster, peptidoform, charge): the best-PEP PSM. With ``max_psms_per_pfz_clustered``, a
+   peptidoform+charge with more PSMs only sent that many to clustering (``common.thinning``, same rule as
+   convert-dat); the rest count in its totals but are not output candidates.
 4. At most ``max_rows_per_pfz`` rows per peptidoform+charge: rows sorted by RT, split into that many
    equal-count slices, one hash-random row per slice.
 
@@ -30,7 +32,8 @@ from pyspectrafuse import __version__
 
 logger = logging.getLogger(__name__)
 
-DEFAULTS = dict(max_rows_per_pfz=30, majority=0.8, weak_max_runs=2, weak_min_series=4)
+DEFAULTS = dict(max_rows_per_pfz=30, majority=0.8, weak_max_runs=2, weak_min_series=4,
+                max_psms_per_pfz_clustered=None)
 FLOAT_LISTS = ["mz_array", "intensity_array"]
 SCORES = [("cluster_size", None), ("cluster_label_psms", None), ("cluster_label_fraction", True),
           ("cluster_label_runs", None), ("cluster_label_median_pep", False), ("cluster_conflict", False),
@@ -130,6 +133,9 @@ def _rule_text(p: dict, weak: bool) -> str:
     if weak:
         s += (f"PSMs whose peptidoform is seen in <= {p['weak_max_runs']} runs and whose longest b/y ion series is "
               f"< {p['weak_min_series']} removed; ")
+    if p.get("max_psms_per_pfz_clustered"):
+        s += (f"at most {p['max_psms_per_pfz_clustered']} PSMs per peptidoform+charge clustered (equal-count steps "
+              "over run, RT), the rest counted in pfz totals only; ")
     s += (f"then at most {p['max_rows_per_pfz']} rows per peptidoform+charge, one per equal-count RT slice "
           "(hash-random within slice); pfz_psms/pfz_runs = totals before the cap; qvalue = running mean PEP over "
           "all source PSMs")
@@ -139,7 +145,8 @@ def _rule_text(p: dict, weak: bool) -> str:
 def reduce_psms(psm_files: List[str], cluster_tsvs: List[str], titles: List[str], out_file: str,
                 max_rows_per_pfz: int = DEFAULTS["max_rows_per_pfz"], majority: float = DEFAULTS["majority"],
                 weak_max_runs: int = DEFAULTS["weak_max_runs"], weak_min_series: int = DEFAULTS["weak_min_series"],
-                weak_filter: bool = False, method: str = "MaRaCluster via spectrafuse",
+                weak_filter: bool = False,
+                max_psms_per_pfz_clustered: Optional[int] = DEFAULTS["max_psms_per_pfz_clustered"], method: str = "MaRaCluster via spectrafuse",
                 memory_limit: str = "8GB", threads: int = 4) -> dict:
     """Write the reduced PSM file plus ``<out>.build.json`` and ``<out>.keep.npy``; return the stats."""
     t_start = time.time()
@@ -153,7 +160,8 @@ def reduce_psms(psm_files: List[str], cluster_tsvs: List[str], titles: List[str]
         logger.warning("no ion_type_array column: weak-evidence rule disabled")
         weak_filter = False
     params = dict(max_rows_per_pfz=max_rows_per_pfz, majority=majority, weak_max_runs=weak_max_runs,
-                  weak_min_series=weak_min_series, weak_filter=weak_filter)
+                  weak_min_series=weak_min_series, weak_filter=weak_filter,
+                  max_psms_per_pfz_clustered=max_psms_per_pfz_clustered)
 
     con = duckdb.connect()
     con.execute(f"set threads={int(threads)}; set memory_limit='{memory_limit}'")
@@ -176,9 +184,17 @@ def reduce_psms(psm_files: List[str], cluster_tsvs: List[str], titles: List[str]
         "rowpos": pa.array(np.arange(n, dtype=np.int64)), "run": t["run_file_name"],
         "scan": pc.cast(scan, pa.int64()), "pf": t["peptidoform"], "z": pc.cast(t["charge"], pa.int32()),
         "pep": pc.cast(t["posterior_error_probability"], pa.float64()), "rt": pc.cast(t["rt"], pa.float64())}))
+    from pyspectrafuse.common.thinning import thin_mask
+    thin = np.nonzero(~thin_mask(t["peptidoform"].to_numpy(zero_copy_only=False),
+                                 t["charge"].to_numpy(zero_copy_only=False),
+                                 t["run_file_name"].to_numpy(zero_copy_only=False),
+                                 t["rt"].to_numpy(zero_copy_only=False), max_psms_per_pfz_clustered))[0]
     del t, scan
     con.execute("create table m as select * from meta_arrow")
     con.unregister("meta_arrow")
+    con.register("th_arrow", pa.table({"rowpos": pa.array(thin, pa.int64())}))
+    con.execute("create table th as select * from th_arrow")
+    con.unregister("th_arrow")
     if q1("select count(*) from m where pep is null")[0]:
         raise ValueError("PSMs without posterior_error_probability")
     dup = q1("select count(*) - count(distinct (run, scan, z)) from m")[0]
@@ -198,10 +214,15 @@ def reduce_psms(psm_files: List[str], cluster_tsvs: List[str], titles: List[str]
         raise ValueError("cluster TSV rows without a _charge<N>_w<M>.mgf source")
     con.execute("""create table mem as select ti.run, ti.scan, ti.z, any_value(ti.z || ':' || tsv.cid) cid,
                      count(*) ncopies from tsv join ti using (z, scannr) group by ti.run, ti.scan, ti.z""")
+    bad = q1("select count(*) from m semi join th using (rowpos) semi join mem using (run, scan, z)")[0]
+    if bad:
+        raise ValueError(f"{bad} PSMs left out by thinning are in the clusters: convert-dat used a different "
+                         "max_psms_per_pfz than max_psms_per_pfz_clustered")
     con.execute("""create table a as select m.*, coalesce(mem.cid, 'unclustered:' || m.rowpos::varchar) cid,
                      replace(regexp_replace(m.pf, '\\[[^\\]]*\\]|\\([^)]*\\)|[.\\-]', '', 'g'), 'I', 'L') seq
-                   from m left join mem on m.run = mem.run and m.scan = mem.scan and m.z = mem.z""")
-    con.execute("""create table q as select rowpos, sum(pep) over w / count(*) over w qvalue from a
+                   from (select * from m anti join th using (rowpos)) m
+                   left join mem on m.run = mem.run and m.scan = mem.scan and m.z = mem.z""")
+    con.execute("""create table q as select rowpos, sum(pep) over w / count(*) over w qvalue from m
                    window w as (order by pep range between unbounded preceding and current row)""")
     con.execute("""create table lab as select cid, pf, z, any_value(seq) seq, count(*) lpsm, count(distinct run) lruns,
                      median(pep) lmed from a group by cid, pf, z""")
@@ -216,7 +237,9 @@ def reduce_psms(psm_files: List[str], cluster_tsvs: List[str], titles: List[str]
     stats = {"psms_in": n, "clusters": q1("select count(*) from cl")[0],
              "psms_unclustered": q1("select count(*) from a where cid like 'unclustered:%'")[0],
              "spectra_in_2plus_windows": q1("select count(*) from mem where ncopies > 1")[0],
-             "pfz_in": q1("select count(distinct (pf, z)) from a")[0]}
+             "psms_thinned": len(thin),
+             "pfz_thinned": q1("select count(distinct (pf, z)) from m semi join th using (rowpos)")[0],
+             "pfz_in": q1("select count(distinct (pf, z)) from m")[0]}
     stats["rows_contradicted_removed"], stats["psms_contradicted_removed"] = q1(
         "select count(*), coalesce(sum(lpsm), 0) from k_all where contradicted")
     stats["pfz_lost_contradicted"] = q1(
@@ -243,7 +266,11 @@ def reduce_psms(psm_files: List[str], cluster_tsvs: List[str], titles: List[str]
                    from (select cid, pf, z, count(*) lpsm, count(distinct run) lruns, median(pep) lmed,
                            arg_min(rowpos, (pep, rowpos)) keep from a3 group by cid, pf, z) lab3
                    join cl using (cid) join k_all kk using (cid, pf, z)""")
-    con.execute("create table tot as select pf, z, count(*) pfz_psms, count(distinct run) pfz_runs from a3 group by pf, z")
+    con.execute("""create table th3 as select m.pf, m.z, m.run from m semi join th using (rowpos)
+                   semi join (select distinct pf, z from a3) y using (pf, z)""")
+    stats["psms_thinned_dropped"] = len(thin) - q1("select count(*) from th3")[0]
+    con.execute("""create table tot as select pf, z, count(*) pfz_psms, count(distinct run) pfz_runs from
+                   (select pf, z, run from a3 union all select pf, z, run from th3) group by pf, z""")
     con.execute("""create table s as select k.rowpos, k.pf, k.z, count(*) over (partition by k.pf, k.z) gn,
                      row_number() over (partition by k.pf, k.z order by m.rt, k.rowpos) gr
                    from k join m using (rowpos)""")
@@ -253,7 +280,8 @@ def reduce_psms(psm_files: List[str], cluster_tsvs: List[str], titles: List[str]
                    group by pf, z, strat""")
     stats["rows_before_cap"] = q1("select count(*) from s")[0]
     stats["psms_in_pfz_totals"] = q1("select coalesce(sum(pfz_psms), 0) from tot")[0]
-    assert stats["psms_in_pfz_totals"] + stats["psms_contradicted_removed"] + stats["psms_weak_removed"] == n, stats
+    assert (stats["psms_in_pfz_totals"] + stats["psms_contradicted_removed"] + stats["psms_weak_removed"]
+            + stats["psms_thinned_dropped"] == n), stats
     kt = _arrow(con.execute("""select k.*, q.qvalue, tot.pfz_psms, tot.pfz_runs from k join capk using (rowpos)
                                join q using (rowpos) join tot using (pf, z) order by rowpos"""))
     con.close()

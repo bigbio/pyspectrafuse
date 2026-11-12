@@ -188,3 +188,77 @@ def test_duckdb_memory_from_env(monkeypatch):
     con = _create_connection()
     lim = con.execute("select current_setting('memory_limit')").fetchone()[0]
     assert lim.startswith("1.1") or "1234" in lim or lim.startswith("1.2"), lim
+
+
+def _thinned_project(tmp_path, cap):
+    """The fixture with clusters only for the PSMs convert-dat --max-psms-per-pfz would write."""
+    from pyspectrafuse.common.thinning import thin_mask
+    psm_dir, tsv, titles, rows = _project(tmp_path)
+    keep = thin_mask([r["peptidoform"] for r in rows], [2] * len(rows), [r["run_file_name"] for r in rows],
+                     [r["rt"] for r in rows], cap)
+    for path in (tsv, titles):
+        lines = Path(path).read_text().splitlines()
+        idx = [int(x.split("\t")[1]) for x in lines]
+        Path(path).write_text("".join(x + "\n" for x, i in zip(lines, idx) if keep[i]))
+    return psm_dir, tsv, titles, rows, keep
+
+
+def test_thin_mask_spreads_over_runs():
+    from pyspectrafuse.common.thinning import thin_mask
+    n = 1000
+    pf = ["A"] * n + ["B"] * 5
+    run = [f"r{i % 10}" for i in range(n)] + ["r0"] * 5
+    rt = list(np.arange(n, dtype=float)) + [1.0] * 5
+    keep = thin_mask(pf, [3] * (n + 5), run, rt, 100)
+    assert keep[:n].sum() == 100 and keep[n:].all()
+    assert {run[i] for i in np.nonzero(keep[:n])[0]} == {f"r{i}" for i in range(10)}
+    assert (keep == thin_mask(pf, [3] * (n + 5), run, rt, 100)).all()
+    assert thin_mask(pf, [3] * (n + 5), run, rt, None).all()
+
+
+def test_reduce_with_thinning(tmp_path):
+    psm_dir, tsv, titles, rows, keep = _thinned_project(tmp_path, 12)
+    out = str(tmp_path / "out.psm.parquet")
+    st = reduce_psms(_files(psm_dir), [tsv], [titles], out, max_rows_per_pfz=5, max_psms_per_pfz_clustered=12)
+    assert st["psms_thinned"] == int((~keep).sum()) == 39 and st["pfz_thinned"] == 2
+    assert st["psms_unclustered"] == 2 and st["psms_thinned_dropped"] == 0
+    t = pq.read_table(out)
+    pfs = t["peptidoform"].to_pylist()
+    assert pfs.count("MANYPEPK") == 5
+    sc = {p: {x["score_name"]: x["score_value"] for x in s} for p, s in zip(pfs, t["additional_scores"].to_pylist())}
+    assert sc["MANYPEPK"]["pfz_psms"] == 50 and sc["MANYPEPK"]["pfz_runs"] == 7
+    assert sc["PEPTIDEK"]["pfz_psms"] == 13
+    kept = set(np.load(out + ".keep.npy").tolist())
+    assert kept <= set(np.nonzero(keep)[0].tolist())
+    assert json.loads(pq.ParquetFile(out).schema_arrow.metadata[b"clustering_params"])["max_psms_per_pfz_clustered"] == 12
+    assert verify_reduced(_files(psm_dir), out)["rows_checked_identical"] == t.num_rows
+
+
+def test_reduce_thinning_mismatch(tmp_path):
+    psm_dir, tsv, titles, _ = _project(tmp_path)
+    with pytest.raises(ValueError, match="different"):
+        reduce_psms(_files(psm_dir), [tsv], [titles], str(tmp_path / "o.psm.parquet"), max_psms_per_pfz_clustered=12)
+
+
+def test_convert_dat_thinning(tmp_path):
+    from pyspectrafuse.common.thinning import thin_mask
+    psm_dir, _, _, rows = _project(tmp_path)
+    for p in _files(psm_dir):
+        t = pq.read_table(p)
+        mz = pa.array([[150.0 + 7.3 * i for i in range(40)]] * t.num_rows, pa.list_(pa.float32()))
+        it = pa.array([[10.0 + i for i in range(40)]] * t.num_rows, pa.list_(pa.float32()))
+        t = t.set_column(t.schema.get_field_index("mz_array"), "mz_array", mz)
+        t = t.set_column(t.schema.get_field_index("intensity_array"), "intensity_array", it)
+        pq.write_table(t, p)
+    out = tmp_path / "dat"
+    r = CliRunner().invoke(cli, ["convert-dat", "-p", str(psm_dir), "-o", str(out), "-c", "2", "--combine",
+                                 "--max-psms-per-pfz", "12"])
+    assert r.exit_code == 0, r.output
+    keep = thin_mask([x["peptidoform"] for x in rows], [2] * len(rows), [x["run_file_name"] for x in rows],
+                     [x["rt"] for x in rows], 12)
+    got = [(x.split("\t")[2]) for x in (out / "proj_charge2.scan_titles.txt").read_text().splitlines()]
+    want = [f"id=mzspec::{x['run_file_name']}:scan:{x['scan'][0]}:{x['peptidoform']}/2"
+            for x, k in zip(rows, keep) if k]
+    assert got == want
+    r = CliRunner().invoke(cli, ["convert-dat", "-p", str(psm_dir), "-o", str(out), "--max-psms-per-pfz", "12"])
+    assert r.exit_code != 0
