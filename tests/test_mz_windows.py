@@ -1,4 +1,4 @@
-"""m/z windowing: fixed windows unchanged, count-capped windows bounded and overlap-safe."""
+"""m/z windowing: fixed overlapping windows, every spectrum kept and close pairs share a window."""
 from pathlib import Path
 
 import numpy as np
@@ -21,12 +21,11 @@ def _mzs(n=20000, seed=1):
     return np.concatenate([r.normal(650, 40, n), r.uniform(200, 2000, n // 10)]).astype(np.float32)
 
 
-def test_capped_windows(tmp_path):
+def test_split_windows(tmp_path):
     mzs = _mzs()
     paths = _dat(tmp_path, mzs)
-    res = split_dat_by_mz_window(*paths, str(tmp_path / "w"), max_spectra_per_window=3000)
-    assert max(r["n_spectra"] for r in res) <= 3000 * 1.2
-    assert len(res) > 7
+    res = split_dat_by_mz_window(*paths, str(tmp_path / "w"))
+    assert [(r["mz_min"], r["mz_max"]) for r in res] == mz_windows()
     member = {}
     for r in res:
         scans = np.frombuffer(Path(r["dat_path"]).read_bytes(), np.uint8).reshape(-1, 100)[:, 4:8].copy().view("<u4").ravel()
@@ -42,8 +41,8 @@ def test_capped_windows(tmp_path):
             assert member[int(a)] & member[int(b)], (mzs[a], mzs[b])
 
 
-def test_mz_windows_no_cap_is_fixed():
-    w = mz_windows(np.array([500.0], np.float32))
+def test_mz_windows_fixed():
+    w = mz_windows()
     assert w[0] == (200.0, 500.0) and w[1] == (499.0, 799.0) and w[-1][1] == 2000.0
     with pytest.raises(ValueError):
-        mz_windows(np.array([500.0]), window_size=1.0, window_overlap=1.0)
+        mz_windows(window_size=1.0, window_overlap=1.0)

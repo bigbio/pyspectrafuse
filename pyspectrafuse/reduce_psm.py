@@ -16,7 +16,7 @@ Rules, in order (all PSMs of the project are clustered first, per charge, with M
    equal-count slices, one hash-random row per slice.
 
 Kept rows are copied unchanged; cluster scores go in ``additional_scores``, the cluster id in ``cv_params``,
-``qvalue`` is the running mean PEP over all source PSMs, and the rule and parameters go in the footer.
+``qvalue`` is the running mean PEP over all source spectra (rule 0 applied), and the rule and parameters go in the footer.
 """
 import json
 import logging
@@ -32,6 +32,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from pyspectrafuse import __version__
+from pyspectrafuse.common.thinning import cluster_mask, first_scan
 
 logger = logging.getLogger(__name__)
 
@@ -77,9 +78,9 @@ def find_psm_files(psm_dir: str) -> List[str]:
     return files
 
 
-def _arrow(cur) -> pa.Table:
-    f = getattr(cur, "to_arrow_table", None) or getattr(cur, "fetch_arrow_table")
-    return f()
+def _arrow(con, sql: str) -> pa.Table:
+    rel = con.sql(sql)
+    return (getattr(rel, "to_arrow_table", None) or rel.arrow)()
 
 
 def longest_ion_series(ion_types: pa.Array, plen: np.ndarray) -> np.ndarray:
@@ -141,7 +142,7 @@ def _rule_text(p: dict, weak: bool) -> str:
               "over run, RT), the rest left out of rows and pfz totals; ")
     s += (f"then at most {p['max_rows_per_pfz']} rows per peptidoform+charge, one per equal-count RT slice "
           "(hash-random within slice); pfz_psms/pfz_runs = totals before the cap; qvalue = running mean PEP over "
-          "all source PSMs")
+          "all source spectra")
     return s
 
 
@@ -162,10 +163,13 @@ def reduce_psms(psm_files: List[str], cluster_tsvs: List[str], titles: List[str]
     if weak_filter and "ion_type_array" not in names:
         logger.warning("no ion_type_array column: weak-evidence rule disabled")
         weak_filter = False
-    params = dict(max_rows_per_pfz=max_rows_per_pfz, majority=majority, weak_max_runs=weak_max_runs,
-                  weak_min_series=weak_min_series, weak_filter=weak_filter,
+    params = dict(max_rows_per_pfz=max_rows_per_pfz, majority=majority, weak_filter=weak_filter,
                   max_psms_per_pfz_clustered=max_psms_per_pfz_clustered)
+    if weak_filter:
+        params.update(weak_max_runs=weak_max_runs, weak_min_series=weak_min_series)
 
+    if "qvalue" in names:
+        logger.warning("input qvalue column is replaced by the running mean PEP")
     con = duckdb.connect()
     con.execute(f"set threads={int(threads)}; set memory_limit='{memory_limit}'")
     tmp = os.environ.get("SPECTRAFUSE_DUCKDB_TEMP_DIR")
@@ -180,21 +184,13 @@ def reduce_psms(psm_files: List[str], cluster_tsvs: List[str], titles: List[str]
         n_decoy = int(pc.sum(pc.cast(t["is_decoy"], pa.int64())).as_py() or 0)
         if n_decoy:
             raise ValueError(f"{n_decoy} decoy PSMs: PEP-derived q-values assume a target-only table")
-    scan = t["scan"]
-    if pa.types.is_list(scan.type):
-        scan = pc.list_element(scan, 0)
+    scan = first_scan(t["scan"])
     con.register("meta_arrow", pa.table({
-        "rowpos": pa.array(np.arange(n, dtype=np.int64)), "run": t["run_file_name"],
-        "scan": pc.cast(scan, pa.int64()), "pf": t["peptidoform"], "z": pc.cast(t["charge"], pa.int32()),
+        "rowpos": pa.array(np.arange(n, dtype=np.int64)), "run": t["run_file_name"], "scan": scan,
+        "pf": t["peptidoform"], "z": pc.cast(t["charge"], pa.int32()),
         "pep": pc.cast(t["posterior_error_probability"], pa.float64()), "rt": pc.cast(t["rt"], pa.float64())}))
-    from pyspectrafuse.common.thinning import cluster_mask
-    thin = np.nonzero(~cluster_mask(t["peptidoform"].to_numpy(zero_copy_only=False),
-                                    t["charge"].to_numpy(zero_copy_only=False),
-                                    t["run_file_name"].to_numpy(zero_copy_only=False),
-                                    pc.cast(scan, pa.int64()).to_numpy(zero_copy_only=False),
-                                    t["rt"].to_numpy(zero_copy_only=False),
-                                    t["posterior_error_probability"].to_numpy(zero_copy_only=False),
-                                    max_psms_per_pfz_clustered))[0]
+    thin = np.nonzero(~cluster_mask(t["peptidoform"], t["charge"], t["run_file_name"], scan, t["rt"],
+                                    t["posterior_error_probability"], max_psms_per_pfz_clustered))[0]
     del t, scan
     con.execute("""create table m as select * from meta_arrow semi join (
                      select arg_min(rowpos, (pep, rowpos)) rowpos from meta_arrow group by run, scan, z) b using (rowpos)""")
@@ -220,7 +216,7 @@ def reduce_psms(psm_files: List[str], cluster_tsvs: List[str], titles: List[str]
       where cid is not null and mgf is not null""")
     if q1("select count(*) from tsv where z is null")[0]:
         raise ValueError("cluster TSV rows without a _charge<N>_w<M>.mgf source")
-    con.execute("""create table mem as select ti.run, ti.scan, ti.z, any_value(ti.z || ':' || tsv.cid) cid,
+    con.execute("""create table mem as select ti.run, ti.scan, ti.z, min(ti.z || ':' || tsv.cid) cid,
                      count(*) ncopies from tsv join ti using (z, scannr) group by ti.run, ti.scan, ti.z""")
     bad = q1("select count(*) from m semi join th using (rowpos) semi join mem using (run, scan, z)")[0]
     if bad:
@@ -258,8 +254,8 @@ def reduce_psms(psm_files: List[str], cluster_tsvs: List[str], titles: List[str]
                    semi join (select cid, pf, z from k_all where not contradicted) g using (cid, pf, z)""")
     if weak_filter:
         con.execute("create table r2 as select pf, z, count(distinct run) runs from a2 group by pf, z")
-        cand = np.sort(_arrow(con.execute(
-            f"select a2.rowpos from a2 join r2 using (pf, z) where r2.runs <= {weak_max_runs}"))["rowpos"].to_numpy())
+        cand = np.sort(_arrow(con, f"select a2.rowpos from a2 join r2 using (pf, z) where r2.runs <= {weak_max_runs}")
+                       ["rowpos"].to_numpy())
         lg = _longest_for_rows(parts, cand) if len(cand) else np.zeros(0, np.int32)
         con.register("lg_arrow", pa.table({"rowpos": pa.array(cand, pa.int64()), "longest": pa.array(lg, pa.int32())}))
         con.execute(f"create table weak as select rowpos from lg_arrow where longest < {weak_min_series}")
@@ -288,8 +284,8 @@ def reduce_psms(psm_files: List[str], cluster_tsvs: List[str], titles: List[str]
     stats["psms_in_pfz_totals"] = q1("select coalesce(sum(pfz_psms), 0) from tot")[0]
     assert (stats["psms_in_pfz_totals"] + stats["psms_contradicted_removed"] + stats["psms_weak_removed"]
             + stats["psms_thinned"] + n_dup == n), stats
-    kt = _arrow(con.execute("""select k.*, q.qvalue, tot.pfz_psms, tot.pfz_runs from k join capk using (rowpos)
-                               join q using (rowpos) join tot using (pf, z) order by rowpos"""))
+    kt = _arrow(con, """select k.*, q.qvalue, tot.pfz_psms, tot.pfz_runs from k join capk using (rowpos)
+                        join q using (rowpos) join tot using (pf, z) order by rowpos""")
     con.close()
     keep = kt["rowpos"].to_numpy()
     np.save(out_file + ".keep.npy", keep)
@@ -323,6 +319,9 @@ def _write_rows(parts: PsmParts, keep, vals, qv, cids, out_file: str, footer: di
     pos = np.full(n, -1, np.int64)
     pos[keep] = np.arange(len(keep))
     md = dict(parts.schema.metadata or {})
+    if b"creation_date" in md:
+        md[b"source_creation_date"] = md[b"creation_date"]
+    md[b"creation_date"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()).encode()
     md.update({k.encode(): v.encode() for k, v in footer.items()})
     names = [s for s, _ in SCORES]
     hb = [h for _, h in SCORES]

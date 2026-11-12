@@ -317,3 +317,24 @@ def test_reduce_duplicates_with_thinning(tmp_path):
     sc = {p: {x["score_name"]: x["score_value"] for x in s}
           for p, s in zip(pq.read_table(out)["peptidoform"].to_pylist(), pq.read_table(out)["additional_scores"].to_pylist())}
     assert sc["MANYPEPK"]["pfz_psms"] == 12
+
+
+def test_reduce_footer(tmp_path):
+    psm_dir, tsv, titles, _ = _project(tmp_path)
+    out = str(tmp_path / "out.psm.parquet")
+    reduce_psms(_files(psm_dir), [tsv], [titles], out, max_rows_per_pfz=5)
+    md = pq.ParquetFile(out).schema_arrow.metadata
+    params = json.loads(md[b"clustering_params"])
+    assert params["weak_filter"] is False and "weak_max_runs" not in params
+    assert md[b"creation_date"].decode().endswith("Z") and int(md[b"clustering_source_rows"]) > 0
+
+
+def test_reduce_rejects_null_scan(tmp_path):
+    psm_dir, tsv, titles, _ = _project(tmp_path)
+    f = _files(psm_dir)[0]
+    t = pq.read_table(f)
+    i = t.schema.get_field_index("scan")
+    t = t.set_column(i, "scan", pa.array([None] + t["scan"].to_pylist()[1:], t.schema.field(i).type))
+    pq.write_table(t, f)
+    with pytest.raises(ValueError, match="without a scan number"):
+        reduce_psms(_files(psm_dir), [tsv], [titles], str(tmp_path / "o.psm.parquet"))

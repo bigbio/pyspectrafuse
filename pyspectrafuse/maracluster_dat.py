@@ -158,7 +158,7 @@ def parquet_to_dat(
     """
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    paths = [parquet_path] if isinstance(parquet_path, (str, Path)) else list(parquet_path)
+    paths = [parquet_path] if isinstance(parquet_path, (str, Path)) else sorted(str(p) for p in parquet_path)
     if not paths:
         raise ValueError("no parquet files given")
     name = name or Path(paths[0]).stem
@@ -191,18 +191,12 @@ def parquet_to_dat(
 def _thin_masks(paths, cap: Optional[int]):
     if not cap:
         return [None] * len(paths)
-    from pyspectrafuse.common.thinning import cluster_mask
     import pyarrow as pa
-    import pyarrow.compute as pc
+    from pyspectrafuse.common.thinning import cluster_mask, first_scan
     t = pa.concat_tables([pq.read_table(p, columns=['peptidoform', 'charge', 'run_file_name', 'rt', 'scan',
                                                     'posterior_error_probability']) for p in paths])
-    scan = t['scan']
-    if pa.types.is_list(scan.type):
-        scan = pc.list_element(scan, 0)
-    keep = cluster_mask(t['peptidoform'].to_numpy(zero_copy_only=False), t['charge'].to_numpy(zero_copy_only=False),
-                        t['run_file_name'].to_numpy(zero_copy_only=False), scan.to_numpy(zero_copy_only=False),
-                        t['rt'].to_numpy(zero_copy_only=False),
-                        t['posterior_error_probability'].to_numpy(zero_copy_only=False), cap)
+    keep = cluster_mask(t['peptidoform'], t['charge'], t['run_file_name'], first_scan(t['scan']), t['rt'],
+                        t['posterior_error_probability'], cap)
     logger.info(f"clustering input: {int((~keep).sum())} of {len(keep)} PSMs left out "
                 f"(repeated spectra, then cap {cap} per peptidoform+charge)")
     bounds = np.cumsum([0] + [pq.ParquetFile(p).metadata.num_rows for p in paths])
@@ -377,41 +371,21 @@ def write_dat_file_list(dat_paths: List[str], output_path: str) -> str:
     return output_path
 
 
-def mz_windows(prec_mzs: np.ndarray, window_size: float = 300.0, window_overlap: float = 1.0,
-               min_mz: float = 200.0, max_mz: float = 2000.0,
-               max_spectra: Optional[int] = None) -> List[Tuple[float, float]]:
-    """Precursor m/z windows: fixed-width, then any window holding more than ``max_spectra`` spectra is cut
-    into equal-count sub-windows. Adjacent windows overlap by ``window_overlap`` Da so every pair of spectra
-    within MaRaCluster's precursor tolerance shares at least one window."""
+def mz_windows(window_size: float = 300.0, window_overlap: float = 1.0,
+               min_mz: float = 200.0, max_mz: float = 2000.0) -> List[Tuple[float, float]]:
+    """Fixed-width precursor m/z windows; adjacent windows overlap by ``window_overlap`` Da."""
     if window_overlap >= window_size:
         raise ValueError(
             f"window_overlap ({window_overlap}) must be less than "
             f"window_size ({window_size}) to avoid infinite loop")
-    fixed = []
+    out = []
     start = min_mz
     while start < max_mz:
         end = min(start + window_size, max_mz)
-        fixed.append((start, end))
+        out.append((start, end))
         if end >= max_mz:
             break
         start = end - window_overlap
-    if not max_spectra:
-        return fixed
-    srt = np.sort(prec_mzs)
-    out = []
-    for wmin, wmax in fixed:
-        lo, hi = np.searchsorted(srt, wmin), np.searchsorted(srt, wmax)
-        n = hi - lo
-        k = int(np.ceil(n / max_spectra)) if n > max_spectra else 1
-        cuts = [wmin]
-        for j in range(1, k):
-            pos = lo + (j * n) // k
-            cut = float(srt[pos - 1] + srt[pos]) / 2
-            if cut - window_overlap > cuts[-1]:
-                cuts.append(cut)
-        cuts.append(wmax)
-        for j in range(len(cuts) - 1):
-            out.append((cuts[j] if j == 0 else cuts[j] - window_overlap, cuts[j + 1]))
     return out
 
 
@@ -424,15 +398,13 @@ def split_dat_by_mz_window(
     window_overlap: float = 1.0,
     min_mz: float = 200.0,
     max_mz: float = 2000.0,
-    max_spectra_per_window: Optional[int] = None,
 ) -> List[Dict]:
     """Split a .dat file into precursor m/z windows for parallel MaRaCluster.
 
     MaRaCluster uses 20 ppm precursor tolerance internally — spectra far apart
     in m/z can NEVER cluster together. This function formalizes that by splitting
     spectra into overlapping m/z windows, enabling Nextflow to run MaRaCluster
-    on each window in parallel. With ``max_spectra_per_window`` dense windows are
-    cut further into equal-count sub-windows, which bounds MaRaCluster's memory.
+    on each window in parallel.
 
     Args:
         dat_path: Path to the .dat file (100 bytes/spectrum).
@@ -443,7 +415,6 @@ def split_dat_by_mz_window(
         window_overlap: Overlap between adjacent windows in Da (default 1.0).
         min_mz: Minimum precursor m/z (default 200).
         max_mz: Maximum precursor m/z (default 2000).
-        max_spectra_per_window: Cut windows holding more spectra than this (default: no cut).
 
     Returns:
         List of dicts, each with keys:
@@ -470,7 +441,7 @@ def split_dat_by_mz_window(
     with open(titles_path) as f:
         title_lines = f.readlines()
 
-    windows = mz_windows(prec_mzs, window_size, window_overlap, min_mz, max_mz, max_spectra_per_window)
+    windows = mz_windows(window_size, window_overlap, min_mz, max_mz)
     stem = Path(dat_path).stem
     results = []
     idx = -1
