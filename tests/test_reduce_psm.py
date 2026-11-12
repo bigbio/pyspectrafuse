@@ -192,10 +192,11 @@ def test_duckdb_memory_from_env(monkeypatch):
 
 def _thinned_project(tmp_path, cap):
     """The fixture with clusters only for the PSMs convert-dat --max-psms-per-pfz would write."""
-    from pyspectrafuse.common.thinning import thin_mask
+    from pyspectrafuse.common.thinning import cluster_mask
     psm_dir, tsv, titles, rows = _project(tmp_path)
-    keep = thin_mask([r["peptidoform"] for r in rows], [2] * len(rows), [r["run_file_name"] for r in rows],
-                     [r["rt"] for r in rows], cap)
+    keep = cluster_mask([r["peptidoform"] for r in rows], [2] * len(rows), [r["run_file_name"] for r in rows],
+                        [r["scan"][0] for r in rows], [r["rt"] for r in rows],
+                        [r["posterior_error_probability"] for r in rows], cap)
     for path in (tsv, titles):
         lines = Path(path).read_text().splitlines()
         idx = [int(x.split("\t")[1]) for x in lines]
@@ -277,3 +278,42 @@ def test_reduce_duplicate_spectrum(tmp_path):
     assert st["psms_in"] == len(rows) + 1 and st["psms_duplicate_spectrum_removed"] == 1
     assert st["pfz_lost_duplicate_spectrum"] == 0
     assert 0.5 not in pq.read_table(out)["posterior_error_probability"].to_pylist()
+
+
+def test_cluster_mask_drops_repeated_spectra_before_thinning():
+    from pyspectrafuse.common.thinning import cluster_mask
+    n = 30
+    pf, run, scan, rt, pep = ["A"] * n, ["r0"] * n, list(range(n)), [float(i) for i in range(n)], [0.01] * n
+    pf += ["A"] * n; run += ["r0"] * n; scan += list(range(n)); rt += rt[:n]; pep += [0.001] * n   # better twins
+    keep = cluster_mask(pf, [2] * (2 * n), run, scan, rt, pep, 10)
+    assert keep.sum() == 10 and not keep[:n].any()
+    full = cluster_mask(pf, [2] * (2 * n), run, scan, rt, pep, None)
+    assert full.sum() == n and full[n:].all()
+
+
+def test_reduce_duplicates_with_thinning(tmp_path):
+    psm_dir, tsv, titles, rows = _project(tmp_path)
+    f = _files(psm_dir)[-1]
+    t = pq.read_table(f)
+    many = [i for i, p in enumerate(t["peptidoform"].to_pylist()) if p == "MANYPEPK"]
+    dup = t.take(many)
+    dup = dup.set_column(dup.schema.get_field_index("posterior_error_probability"), "posterior_error_probability",
+                         pa.array([1e-9] * len(many), pa.float64()))
+    pq.write_table(pa.concat_tables([t, dup]), f)
+    from pyspectrafuse.common.thinning import cluster_mask
+    a = pa.concat_tables([pq.read_table(x) for x in _files(psm_dir)])
+    keep = cluster_mask(a["peptidoform"].to_pylist(), a["charge"].to_pylist(), a["run_file_name"].to_pylist(),
+                        [s[0] for s in a["scan"].to_pylist()], a["rt"].to_pylist(),
+                        a["posterior_error_probability"].to_pylist(), 12)
+    sent = {(r, s[0]) for r, s, k in zip(a["run_file_name"].to_pylist(), a["scan"].to_pylist(), keep) if k}
+    for path in (tsv, titles):
+        lines = Path(path).read_text().splitlines()
+        Path(path).write_text("".join(x + "\n" for x, r in zip(lines, [rows[int(y.split("\t")[1])] for y in lines])
+                                      if (r["run_file_name"], r["scan"][0]) in sent))
+    out = str(tmp_path / "out.psm.parquet")
+    st = reduce_psms(_files(psm_dir), [tsv], [titles], out, max_rows_per_pfz=5, max_psms_per_pfz_clustered=12)
+    assert st["psms_duplicate_spectrum_removed"] == len(many) == 30
+    assert st["psms_in"] == len(rows) + len(many)
+    sc = {p: {x["score_name"]: x["score_value"] for x in s}
+          for p, s in zip(pq.read_table(out)["peptidoform"].to_pylist(), pq.read_table(out)["additional_scores"].to_pylist())}
+    assert sc["MANYPEPK"]["pfz_psms"] == 50

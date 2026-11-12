@@ -191,13 +191,20 @@ def parquet_to_dat(
 def _thin_masks(paths, cap: Optional[int]):
     if not cap:
         return [None] * len(paths)
-    from pyspectrafuse.common.thinning import thin_mask
+    from pyspectrafuse.common.thinning import cluster_mask
     import pyarrow as pa
-    t = pa.concat_tables([pq.read_table(p, columns=['peptidoform', 'charge', 'run_file_name', 'rt'])
-                          for p in paths])
-    keep = thin_mask(t['peptidoform'].to_numpy(zero_copy_only=False), t['charge'].to_numpy(zero_copy_only=False),
-                     t['run_file_name'].to_numpy(zero_copy_only=False), t['rt'].to_numpy(zero_copy_only=False), cap)
-    logger.info(f"thinning: {int((~keep).sum())} of {len(keep)} PSMs left out (cap {cap} per peptidoform+charge)")
+    import pyarrow.compute as pc
+    t = pa.concat_tables([pq.read_table(p, columns=['peptidoform', 'charge', 'run_file_name', 'rt', 'scan',
+                                                    'posterior_error_probability']) for p in paths])
+    scan = t['scan']
+    if pa.types.is_list(scan.type):
+        scan = pc.list_element(scan, 0)
+    keep = cluster_mask(t['peptidoform'].to_numpy(zero_copy_only=False), t['charge'].to_numpy(zero_copy_only=False),
+                        t['run_file_name'].to_numpy(zero_copy_only=False), scan.to_numpy(zero_copy_only=False),
+                        t['rt'].to_numpy(zero_copy_only=False),
+                        t['posterior_error_probability'].to_numpy(zero_copy_only=False), cap)
+    logger.info(f"clustering input: {int((~keep).sum())} of {len(keep)} PSMs left out "
+                f"(repeated spectra, then cap {cap} per peptidoform+charge)")
     bounds = np.cumsum([0] + [pq.ParquetFile(p).metadata.num_rows for p in paths])
     return [keep[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
 

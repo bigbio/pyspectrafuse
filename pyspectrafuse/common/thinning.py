@@ -31,3 +31,18 @@ def thin_mask(pf, z, run, rt, cap: Optional[int]) -> np.ndarray:
     keep[pos] = False
     keep[pos[first]] = True
     return keep
+
+
+def cluster_mask(pf, z, run, scan, rt, pep, cap: Optional[int]) -> np.ndarray:
+    """True for rows sent to clustering: the best-PEP row per (run, scan, charge), then thin_mask on those."""
+    n = len(pf)
+    df = pd.DataFrame({"run": np.asarray(run, dtype=object), "scan": np.asarray(scan, dtype=np.int64),
+                       "z": np.asarray(z, dtype=np.int64), "pep": np.asarray(pep, dtype=np.float64),
+                       "pos": np.arange(n, dtype=np.int64)})
+    df = df.sort_values(["pep", "pos"], na_position="last", kind="mergesort")
+    best = np.sort(df.drop_duplicates(["run", "scan", "z"])["pos"].to_numpy())
+    keep = np.zeros(n, bool)
+    sub = thin_mask(np.asarray(pf, dtype=object)[best], np.asarray(z)[best], np.asarray(run, dtype=object)[best],
+                    np.asarray(rt, dtype=np.float64)[best], cap)
+    keep[best[sub]] = True
+    return keep

@@ -187,11 +187,14 @@ def reduce_psms(psm_files: List[str], cluster_tsvs: List[str], titles: List[str]
         "rowpos": pa.array(np.arange(n, dtype=np.int64)), "run": t["run_file_name"],
         "scan": pc.cast(scan, pa.int64()), "pf": t["peptidoform"], "z": pc.cast(t["charge"], pa.int32()),
         "pep": pc.cast(t["posterior_error_probability"], pa.float64()), "rt": pc.cast(t["rt"], pa.float64())}))
-    from pyspectrafuse.common.thinning import thin_mask
-    thin = np.nonzero(~thin_mask(t["peptidoform"].to_numpy(zero_copy_only=False),
-                                 t["charge"].to_numpy(zero_copy_only=False),
-                                 t["run_file_name"].to_numpy(zero_copy_only=False),
-                                 t["rt"].to_numpy(zero_copy_only=False), max_psms_per_pfz_clustered))[0]
+    from pyspectrafuse.common.thinning import cluster_mask
+    thin = np.nonzero(~cluster_mask(t["peptidoform"].to_numpy(zero_copy_only=False),
+                                    t["charge"].to_numpy(zero_copy_only=False),
+                                    t["run_file_name"].to_numpy(zero_copy_only=False),
+                                    pc.cast(scan, pa.int64()).to_numpy(zero_copy_only=False),
+                                    t["rt"].to_numpy(zero_copy_only=False),
+                                    t["posterior_error_probability"].to_numpy(zero_copy_only=False),
+                                    max_psms_per_pfz_clustered))[0]
     del t, scan
     con.execute("""create table m as select * from meta_arrow semi join (
                      select arg_min(rowpos, (pep, rowpos)) rowpos from meta_arrow group by run, scan, z) b using (rowpos)""")
