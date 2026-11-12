@@ -262,3 +262,18 @@ def test_convert_dat_thinning(tmp_path):
     assert got == want
     r = CliRunner().invoke(cli, ["convert-dat", "-p", str(psm_dir), "-o", str(out), "--max-psms-per-pfz", "12"])
     assert r.exit_code != 0
+
+
+def test_reduce_duplicate_spectrum(tmp_path):
+    psm_dir, tsv, titles, rows = _project(tmp_path)
+    f = _files(psm_dir)[0]
+    t = pq.read_table(f)
+    dup = t.slice(0, 1)
+    dup = dup.set_column(dup.schema.get_field_index("posterior_error_probability"), "posterior_error_probability",
+                         pa.array([0.5], pa.float64()))
+    pq.write_table(pa.concat_tables([t, dup]), f)
+    out = str(tmp_path / "out.psm.parquet")
+    st = reduce_psms(_files(psm_dir), [tsv], [titles], out, max_rows_per_pfz=5)
+    assert st["psms_in"] == len(rows) + 1 and st["psms_duplicate_spectrum_removed"] == 1
+    assert st["pfz_lost_duplicate_spectrum"] == 0
+    assert 0.5 not in pq.read_table(out)["posterior_error_probability"].to_pylist()
